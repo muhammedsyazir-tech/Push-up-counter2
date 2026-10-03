@@ -1,0 +1,262 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0, user-scalable=no">
+  <title>AR Push-Up Tracker</title>
+  <style>
+    * {
+      box-sizing: border-box;
+      margin: 0;
+      padding: 0;
+    }
+    body {
+      background-color: #0f172a;
+      color: #f8fafc;
+      font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+      overflow: hidden;
+      display: flex;
+      flex-direction: column;
+      align-items: center;
+      justify-content: center;
+      height: 100vh;
+    }
+    #container {
+      position: relative;
+      width: 100vw;
+      height: 100vh;
+      max-width: 600px;
+      overflow: hidden;
+      display: flex;
+      justify-content: center;
+      align-items: center;
+    }
+    video {
+      position: absolute;
+      width: 100%;
+      height: 100%;
+      object-fit: cover;
+      transform: scaleX(-1); /* Mirror camera preview */
+    }
+    canvas {
+      position: absolute;
+      width: 100%;
+      height: 100%;
+      object-fit: cover;
+      transform: scaleX(-1);
+      z-index: 2;
+    }
+    #hud {
+      position: absolute;
+      top: 24px;
+      left: 20px;
+      right: 20px;
+      display: flex;
+      justify-content: space-between;
+      z-index: 3;
+      pointer-events: none;
+    }
+    .card {
+      background: rgba(15, 23, 42, 0.75);
+      backdrop-filter: blur(8px);
+      padding: 12px 20px;
+      border-radius: 12px;
+      border: 1px solid rgba(255, 255, 255, 0.1);
+    }
+    .card .label {
+      font-size: 11px;
+      text-transform: uppercase;
+      letter-spacing: 0.05em;
+      color: #94a3b8;
+    }
+    .card .value {
+      font-size: 32px;
+      font-weight: 800;
+      color: #38bdf8;
+    }
+    #btnStart {
+      position: absolute;
+      bottom: 40px;
+      z-index: 4;
+      padding: 14px 28px;
+      font-size: 16px;
+      font-weight: 600;
+      color: #ffffff;
+      background: #2563eb;
+      border: none;
+      border-radius: 30px;
+      cursor: pointer;
+      box-shadow: 0 4px 14px rgba(37, 99, 235, 0.4);
+    }
+  </style>
+
+  <!-- Load MediaPipe Tasks Vision Bundle via CDN -->
+  <script type="module">
+    import {
+      PoseLandmarker,
+      FilesetResolver,
+      DrawingUtils
+    } from "https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@0.10.14";
+
+    let poseLandmarker;
+    let runningMode = "VIDEO";
+    let video = document.getElementById("webcam");
+    let canvas = document.getElementById("output_canvas");
+    let ctx = canvas.getContext("2d");
+    let startBtn = document.getElementById("btnStart");
+    let repDisplay = document.getElementById("repCount");
+    let stateDisplay = document.getElementById("repState");
+
+    let count = 0;
+    let stage = "up";
+    let lastVideoTime = -1;
+
+    // 1. Initialize Pose Landmarker
+    async function initModel() {
+      const vision = await FilesetResolver.forVisionTasks(
+        "https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@0.10.14/wasm"
+      );
+      poseLandmarker = await PoseLandmarker.createFromOptions(vision, {
+        baseOptions: {
+          modelAssetPath: `https://storage.googleapis.com/mediapipe-models/pose_landmarker/pose_landmarker_lite/float16/1/pose_landmarker_lite.task`,
+          delegate: "GPU"
+        },
+        runningMode: runningMode,
+        numPoses: 1
+      });
+      startBtn.textContent = "Start Camera";
+      startBtn.disabled = false;
+    }
+
+    initModel();
+
+    // 2. Start Camera Feed
+    startBtn.addEventListener("click", async () => {
+      startBtn.style.display = "none";
+      try {
+        const stream = await navigator.mediaDevices.getUserMedia({
+          video: {
+            facingMode: "user",
+            width: { ideal: 640 },
+            height: { ideal: 480 }
+          },
+          audio: false
+        });
+        video.srcObject = stream;
+        video.addEventListener("loadeddata", predictWebcam);
+      } catch (err) {
+        alert("Camera permission denied or camera unavailable: " + err.message);
+      }
+    });
+
+    // Angle calculation between 3 points: A (Shoulder), B (Elbow), C (Wrist)
+    function calculateAngle(a, b, c) {
+      const radians = Math.atan2(c.y - b.y, c.x - b.x) - Math.atan2(a.y - b.y, a.x - b.x);
+      let angle = Math.abs((radians * 180.0) / Math.PI);
+      if (angle > 180.0) {
+        angle = 360 - angle;
+      }
+      return angle;
+    }
+
+    // 3. Frame-by-frame inference loop
+    async function predictWebcam() {
+      canvas.width = video.videoWidth;
+      canvas.height = video.videoHeight;
+
+      if (lastVideoTime !== video.currentTime && poseLandmarker) {
+        lastVideoTime = video.currentTime;
+        let startTimeMs = performance.now();
+        const results = poseLandmarker.detectForVideo(video, startTimeMs);
+
+        ctx.clearRect(0, 0, canvas.width, canvas.height);
+
+        if (results.landmarks && results.landmarks.length > 0) {
+          const landmarks = results.landmarks[0];
+
+          // Left Arm: 11 = Shoulder, 13 = Elbow, 15 = Wrist
+          // Right Arm: 12 = Shoulder, 14 = Elbow, 16 = Wrist
+          const lShoulder = landmarks[11];
+          const lElbow = landmarks[13];
+          const lWrist = landmarks[15];
+
+          const rShoulder = landmarks[12];
+          const rElbow = landmarks[14];
+          const rWrist = landmarks[16];
+
+          // Use the arm that has higher visibility score
+          const useLeft = (lElbow.visibility || 0) >= (rElbow.visibility || 0);
+          const shoulder = useLeft ? lShoulder : rShoulder;
+          const elbow = useLeft ? lElbow : rElbow;
+          const wrist = useLeft ? lWrist : rWrist;
+
+          const angle = calculateAngle(shoulder, elbow, wrist);
+
+          // State Machine Rep Counting
+          if (angle > 160) {
+            stage = "up";
+            stateDisplay.textContent = "UP";
+          }
+          if (angle <= 90 && stage === "up") {
+            stage = "down";
+            count += 1;
+            repDisplay.textContent = count;
+            stateDisplay.textContent = "DOWN";
+
+            // Audio beep/speech feedback
+            if ("speechSynthesis" in window) {
+              const utter = new SpeechSynthesisUtterance(count.toString());
+              utter.rate = 1.2;
+              window.speechSynthesis.speak(utter);
+            }
+          }
+
+          // AR Overlay: Draw joint dots and lines
+          const drawingUtils = new DrawingUtils(ctx);
+          drawingUtils.drawLandmarks(landmarks, {
+            radius: 3,
+            color: "#38bdf8"
+          });
+          drawingUtils.drawConnectors(landmarks, PoseLandmarker.POSE_CONNECTIONS, {
+            color: "#ffffff",
+            lineWidth: 2
+          });
+
+          // Draw live angle label near elbow
+          ctx.save();
+          ctx.scale(-1, 1); // un-mirror text
+          ctx.fillStyle = "#22c55e";
+          ctx.font = "bold 20px sans-serif";
+          ctx.fillText(
+            `${Math.round(angle)}°`,
+            -(elbow.x * canvas.width) - 40,
+            elbow.y * canvas.height
+          );
+          ctx.restore();
+        }
+      }
+
+      window.requestAnimationFrame(predictWebcam);
+    }
+  </script>
+</head>
+<body>
+  <div id="container">
+    <video id="webcam" autoplay playsinline></video>
+    <canvas id="output_canvas"></canvas>
+
+    <div id="hud">
+      <div class="card">
+        <div class="label">Reps</div>
+        <div class="value" id="repCount">0</div>
+      </div>
+      <div class="card">
+        <div class="label">Position</div>
+        <div class="value" id="repState" style="color: #f59e0b;">UP</div>
+      </div>
+    </div>
+
+    <button id="btnStart" disabled>Loading Model...</button>
+  </div>
+</body>
+</html>
